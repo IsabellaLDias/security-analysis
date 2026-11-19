@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
-from statuspage import fetch_history_months, parse_issue_date, parse_month_key
+from statuspage import StatuspageClient, parse_issue_date, parse_month_key
 
 SITES = {
     "GitHub": "www.githubstatus.com", "Cloudflare": "www.cloudflarestatus.com",
@@ -14,6 +14,8 @@ SITES = {
     "Twilio": "status.twilio.com", "Jira Software": "jira-software.status.atlassian.com",
 }
 START, END = date(2025, 1, 1), date(2026, 11, 18)
+START_YM, END_YM = (2025, 1), (2026, 11)
+MAX_PAGES = 8
 ROOT = Path(__file__).resolve().parent
 
 
@@ -24,37 +26,58 @@ def write(name, headers, rows):
         writer.writerows(rows)
 
 
-def collect(job):
-    provider, domain, page = job
+def collect_provider(provider: str, domain: str) -> tuple[dict[str, list], list[list]]:
     base_url = f"https://{domain}"
-    url = f"{base_url}/history?page={page}"
-    rows, coverage = [], []
-    try:
-        url, months = fetch_history_months(base_url, page, timeout=15, retries=1)
-        for month in months:
-            year, number = parse_month_key(month)
-            if (year, number) < (2025, 1) or (year, number) > (2026, 11):
-                continue
-            issues = month["incidents"]
-            coverage.append([provider, url, f"{year}-{number:02}", len(issues), "índice consultado"])
-            for issue in issues:
-                parsed = parse_issue_date(issue, year, number)
-                if not parsed:
+    records: dict[str, list] = {}
+    coverage: list[list] = []
+    seen_months: set[tuple[int, int]] = set()
+
+    with StatuspageClient(timeout=15, retries=1) as client:
+        for page in range(1, MAX_PAGES + 1):
+            url = f"{base_url}/history?page={page}"
+            try:
+                url, months = client.fetch_history_months(base_url, page)
+            except Exception as exc:
+                coverage.append([provider, url, "", "", f"falha de consulta ou leitura ({type(exc).__name__})"])
+                break
+
+            page_months = [(month, parse_month_key(month)) for month in months]
+            if not page_months or all(ym in seen_months for _, ym in page_months):
+                break
+            seen_months.update(ym for _, ym in page_months)
+
+            for month, ym in page_months:
+                if ym < START_YM or ym > END_YM:
                     continue
-                d, raw = parsed
-                if START <= d <= END:
-                    rows.append([provider, d.isoformat(), issue["impact"], issue["name"], f"{base_url}/incidents/{issue['code']}", raw])
-    except Exception as exc:
-        coverage.append([provider, url, "", "", f"falha de consulta ou leitura ({type(exc).__name__})"])
-    return rows, coverage
+                year, number = ym
+                issues = month["incidents"]
+                coverage.append([provider, url, f"{year}-{number:02}", len(issues), "índice consultado"])
+                for issue in issues:
+                    issue_url = f"{base_url}/incidents/{issue['code']}"
+                    if issue_url in records:
+                        continue
+                    parsed = parse_issue_date(issue, year, number)
+                    if not parsed:
+                        continue
+                    d, raw = parsed
+                    if START <= d <= END:
+                        records[issue_url] = [provider, d.isoformat(), issue["impact"], issue["name"], issue_url, raw]
+
+            if min(ym for _, ym in page_months) < START_YM:
+                break
+
+    return records, coverage
+
+
+def main():
+    records, audit = {}, []
+    with ThreadPoolExecutor(max_workers=min(8, len(SITES))) as pool:
+        for prov_records, coverage in pool.map(lambda item: collect_provider(*item), SITES.items()):
+            records.update(prov_records)
+            audit.extend(coverage)
+    write("indice-publico.csv", ["provedor", "data_exibida", "impacto_declarado", "titulo_original", "url", "periodo_exibido"], sorted(records.values()))
+    write("cobertura.csv", ["provedor", "pagina", "mes", "registros_exibidos_antes_da_triagem", "resultado"], sorted(audit))
+
 
 if __name__ == "__main__":
-    jobs = [(name, host, page) for name, host in SITES.items() for page in range(1, 9)]
-    records, audit = {}, []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for rows, coverage in pool.map(collect, jobs):
-            audit.extend(coverage)
-            for row in rows:
-                records[row[4]] = row
-    write("indice-publico.csv", ["provedor","data_exibida","impacto_declarado","titulo_original","url","periodo_exibido"], sorted(records.values()))
-    write("cobertura.csv", ["provedor","pagina","mes","registros_exibidos_antes_da_triagem","resultado"], sorted(audit))
+    main()
